@@ -8,6 +8,10 @@ function updateFixPlan() {
 function ProcessFixPlan(options) {
 	options = options || {};
 	const dryRun = !!options.dryRun;
+	const writeMode = (options.writeMode === 'incremental' || options.writeMode === 'full') ? options.writeMode : 'auto';
+	const effectiveThreshold = (typeof options.threshold === 'number' && options.threshold >= 0 && options.threshold <= 1)
+		? options.threshold
+		: undefined;
 
 	// Config (local only, no globals)
 	const SOURCE_SHEET = 'План_Продаж';
@@ -17,6 +21,7 @@ function ProcessFixPlan(options) {
 	const TZ = 'Europe/Moscow';
 	const NEW_MONTHS_BACK = 2; // current month and previous N months are treated as "new"; all future months are also "new"
 	const SOURCE_ROWS_CHUNK_SIZE = 400; // process source rows in chunks to avoid timeouts on large datasets
+	const INCREMENTAL_CHANGE_THRESHOLD = 0.3; // default threshold for auto mode
 
 	// Column descriptor — single source of truth
 	const HEAD_START = ['Дата (день)', 'idНед', 'idМес'];
@@ -136,21 +141,25 @@ function ProcessFixPlan(options) {
 	const monthsLeftArr = existingMonthsArr.filter(function (m) { return !monthsRewriteSet.has(m); });
 	Logger.log('Перезаписываем месяцы (YYYYMM): %s', Array.from(monthsRewriteSet).sort().join(','));
 	Logger.log('Оставляем без изменений месяцы (YYYYMM): %s', monthsLeftArr.join(','));
-	const kept = existing.filter(function (row) {
+	function shouldKeepExistingRow(row) {
 		const dateVal = row[0];
 		const idMes = (row[2] || '').toString().trim();
 		if (dateVal) {
-			// Daily rows: drop only intersecting days within new months; keep other days of the same month
 			const dk = dateKey(getDateOnly(dateVal), TZ);
 			if (daysSetNewMonths.has(dk)) return false;
-			// If this daily row belongs to an old month we are rewriting monthly, drop it
 			if (idMes && monthsSetOld.has(idMes)) return false;
 			return true;
 		}
-		// Monthly aggregates: drop for both new and old months (new → switch to daily, old → recompute monthly)
 		if (idMes && (monthsSetNew.has(idMes) || monthsSetOld.has(idMes))) return false;
 		return true;
-	});
+	}
+	const deleteRowFlags = new Array(existing.length).fill(false);
+	const kept = [];
+	for (let i = 0; i < existing.length; i++) {
+		const row = existing[i];
+		const keep = shouldKeepExistingRow(row);
+		if (keep) kept.push(row); else deleteRowFlags[i] = true;
+	}
 
 	// 6) Build new rows
 	const dailyRowsNew = [];
@@ -228,26 +237,56 @@ function ProcessFixPlan(options) {
 		return;
 	}
 
-	// 8) Final array (no additional sorting for speed)
-	const finalRows = kept.concat(newRows);
+	// 8) Choose write mode: incremental vs full rewrite
+	const totalExisting = existing.length;
+	const toDeleteCount = deleteRowFlags.reduce(function (acc, f) { return acc + (f ? 1 : 0); }, 0);
+	const toAddCount = newRows.length;
+	const changeRatio = totalExisting > 0 ? (toDeleteCount + toAddCount) / totalExisting : 1;
+	let useIncremental;
+	let modeExplain;
+	if (writeMode === 'incremental') { useIncremental = true; modeExplain = 'forced:incremental'; }
+	else if (writeMode === 'full') { useIncremental = false; modeExplain = 'forced:full'; }
+	else {
+		const thr = (effectiveThreshold !== undefined) ? effectiveThreshold : INCREMENTAL_CHANGE_THRESHOLD;
+		useIncremental = totalExisting > 0 && changeRatio <= thr;
+		modeExplain = 'auto (threshold=' + thr + ')';
+	}
+	Logger.log('Режим записи: ' + (useIncremental ? 'инкрементальный' : 'полная перезапись') + ' [' + modeExplain + ']; удаляем=' + toDeleteCount + ', добавляем=' + toAddCount + ', существовало=' + totalExisting + ', ratio=' + changeRatio.toFixed(3));
+
 	if (dryRun) {
-		Logger.log('dryRun: было бы записано строк: ' + newRows.length + ', итог: ' + finalRows.length + ', SKU: ' + uniqueSkuCount);
+		const finalLen = kept.length + newRows.length;
+		Logger.log('dryRun ' + (useIncremental ? '[incremental]' : '[full]') + ' ' + '[' + modeExplain + ']' + ': удаляем=' + toDeleteCount + ', добавляем=' + toAddCount + ', итог: ' + finalLen + ', SKU: ' + uniqueSkuCount);
 		writeTimestamps(uniqueSkuCount, periodFrom, periodTo, TZ);
 		return;
 	}
-	ensureHeaders(dst, HEADERS);
-	writeResultSafely(dst, finalRows, HEADERS.length, FORCE_TEXT_COLS);
-	writeTimestamps(uniqueSkuCount, periodFrom, periodTo, TZ);
-	Logger.log('Готово: добавлено строк: ' + newRows.length + ', итоговый размер: ' + finalRows.length + ', SKU: ' + uniqueSkuCount);
 
-	// ===== Helpers (scoped to function) =====
-	function col(a1) {
-		const s = a1.toUpperCase();
-		let n = 0;
-		for (let i = 0; i < s.length; i++) n = n * 26 + (s.charCodeAt(i) - 64);
-		return n;
+	ensureHeaders(dst, HEADERS);
+	const sheetUtils = (typeof createSheetUtils === 'function') ? createSheetUtils() : null;
+	if (useIncremental) {
+		// Delete intersecting rows only (bottom-up, grouped ranges)
+		const rowsToDelete = [];
+		for (let i = 0; i < deleteRowFlags.length; i++) if (deleteRowFlags[i]) rowsToDelete.push(i + 2); // body starts at row 2
+		const ranges = sheetUtils ? sheetUtils.buildContiguousRanges(rowsToDelete) : buildContiguousRanges(rowsToDelete);
+		for (let r = ranges.length - 1; r >= 0; r--) {
+			const range = ranges[r];
+			dst.deleteRows(range.start, range.count);
+		}
+		// Append new rows at the end
+		const formatted = sheetUtils ? sheetUtils.formatRowsForWrite(newRows, HEADERS.length, FORCE_TEXT_COLS) : formatRowsForWrite(newRows, HEADERS.length, FORCE_TEXT_COLS);
+		const lastRow = dst.getLastRow();
+		if (sheetUtils) sheetUtils.ensureCapacityRows(dst, lastRow + formatted.length); else ensureCapacityRows(dst, lastRow + formatted.length);
+		if (formatted.length > 0) dst.getRange(lastRow + 1, 1, formatted.length, HEADERS.length).setValues(formatted);
+		Logger.log('Инкрементальная запись: удалено строк=' + toDeleteCount + ', добавлено строк=' + toAddCount + ', итоговый размер тела: ' + (dst.getLastRow() - 1));
+	} else {
+		// Full rewrite for speed on large changes
+		const finalRows = kept.concat(newRows);
+		writeResultSafely(dst, finalRows, HEADERS.length, FORCE_TEXT_COLS);
+		Logger.log('Полная перезапись: добавлено строк=' + newRows.length + ', итоговый размер: ' + finalRows.length);
 	}
 
+	writeTimestamps(uniqueSkuCount, periodFrom, periodTo, TZ);
+
+	// ===== Helpers (scoped to function) =====
 	function ensureHeaders(sheet, headers) {
 		if (sheet.getLastRow() === 0) {
 			sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
@@ -256,6 +295,53 @@ function ProcessFixPlan(options) {
 		const have = sheet.getRange(1, 1, 1, headers.length).getValues()[0] || [];
 		const same = have.length === headers.length && have.every((v, i) => (v || '').toString() === headers[i]);
 		if (!same) sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+	}
+
+	// fallback local implementations kept for compatibility if tech/sheetUtils is not loaded
+	function formatRowsForWrite(rows, colCount, forceTextCols) {
+		const set = new Set(forceTextCols || []);
+		const rowsNormalized = (rows || []).map(function (r) {
+			const base = Array.isArray(r) ? r.slice(0, colCount) : [];
+			while (base.length < colCount) base.push('');
+			return base;
+		});
+		return rowsNormalized.map(function (r) {
+			const out = new Array(r.length);
+			for (let i = 0; i < r.length; i++) {
+				const v = r[i];
+				if (set.has(i)) {
+					if (v === null || v === undefined || v === '') out[i] = '';
+					else {
+						const s = v.toString();
+						out[i] = s.charAt(0) === "'" ? s : ("'" + s);
+					}
+				} else {
+					out[i] = v;
+				}
+			}
+			return out;
+		});
+	}
+
+	function buildContiguousRanges(rowsAsc) {
+		const ranges = [];
+		if (!rowsAsc || rowsAsc.length === 0) return ranges;
+		let start = rowsAsc[0];
+		let prev = rowsAsc[0];
+		let count = 1;
+		for (let i = 1; i < rowsAsc.length; i++) {
+			const cur = rowsAsc[i];
+			if (cur === prev + 1) {
+				count++;
+			} else {
+				ranges.push({ start: start, count: count });
+				start = cur;
+				count = 1;
+			}
+			prev = cur;
+		}
+		ranges.push({ start: start, count: count });
+		return ranges;
 	}
 
 	function buildVariableIndexMap(sheet, varsRow) {
@@ -311,7 +397,7 @@ function ProcessFixPlan(options) {
 		return metrics.map(v => toNumber(v) / denom);
 	}
 
-	function round0(n) { return Math.round(Number(n) || 0); }
+	// round0 was unused; removed
 
 	function toNumber(v) {
 		if (v === null || v === undefined || v === '') return 0;
@@ -453,35 +539,12 @@ function ProcessFixPlan(options) {
 	}
 
 	function writeResultSafely(sheet, rows, colCount, forceTextCols) {
-		const set = new Set(forceTextCols || []);
-		// Normalize rows to exact width to avoid any column shifting regardless of missing values
-		const rowsNormalized = rows.map(r => {
-			const base = Array.isArray(r) ? r.slice(0, colCount) : [];
-			while (base.length < colCount) base.push('');
-			return base;
-		});
-		const formatted = rowsNormalized.map(r => {
-			const out = new Array(r.length);
-			for (let i = 0; i < r.length; i++) {
-				const v = r[i];
-				if (set.has(i)) {
-					if (v === null || v === undefined || v === '') out[i] = '';
-					else {
-						const s = v.toString();
-						out[i] = s.charAt(0) === "'" ? s : ("'" + s);
-					}
-				} else {
-					out[i] = v;
-				}
-			}
-			return out;
-		});
-
-		ensureCapacityRows(sheet, 1 + Math.max(rowsNormalized.length, 1));
-		if (rowsNormalized.length > 0) sheet.getRange(2, 1, rowsNormalized.length, colCount).setValues(formatted);
+		const formatted = formatRowsForWrite(rows, colCount, forceTextCols);
+		ensureCapacityRows(sheet, 1 + Math.max(formatted.length, 1));
+		if (formatted.length > 0) sheet.getRange(2, 1, formatted.length, colCount).setValues(formatted);
 		const lastRow = sheet.getLastRow();
 		const oldBody = Math.max(0, lastRow - 1);
-		if (oldBody > rowsNormalized.length) sheet.getRange(2 + rowsNormalized.length, 1, oldBody - rowsNormalized.length, colCount).clearContent();
+		if (oldBody > formatted.length) sheet.getRange(2 + formatted.length, 1, oldBody - formatted.length, colCount).clearContent();
 	}
 
 	function ensureCapacityRows(sheet, needRows) {

@@ -14,6 +14,58 @@ function createSheetUtils() {
     },
 
     /**
+     * Ensures sheet has at least needRows rows.
+     */
+    ensureCapacityRows(sheet, needRows) {
+      const maxRows = sheet.getMaxRows();
+      if (maxRows < needRows) sheet.insertRowsAfter(maxRows, needRows - maxRows);
+    },
+
+    /**
+     * Normalizes width and applies forced text to specified column indexes (0-based).
+     */
+    formatRowsForWrite(rows, colCount, forceTextCols) {
+      const set = new Set(forceTextCols || []);
+      const rowsNormalized = (rows || []).map(row => {
+        const base = Array.isArray(row) ? row.slice(0, colCount) : [];
+        while (base.length < colCount) base.push('');
+        return base;
+      });
+      return rowsNormalized.map(r => r.map((cell, idx) => {
+        if (set.has(idx)) {
+          if (cell === null || cell === undefined || cell === '') return '';
+          const s = cell.toString();
+          return s.charAt(0) === "'" ? s : ("'" + s);
+        }
+        return cell;
+      }));
+    },
+
+    /**
+     * Groups ascending row indexes into contiguous ranges {start, count}.
+     */
+    buildContiguousRanges(rowsAsc) {
+      const ranges = [];
+      if (!rowsAsc || rowsAsc.length === 0) return ranges;
+      let start = rowsAsc[0];
+      let prev = rowsAsc[0];
+      let count = 1;
+      for (let i = 1; i < rowsAsc.length; i++) {
+        const cur = rowsAsc[i];
+        if (cur === prev + 1) {
+          count++;
+        } else {
+          ranges.push({ start, count });
+          start = cur;
+          count = 1;
+        }
+        prev = cur;
+      }
+      ranges.push({ start, count });
+      return ranges;
+    },
+
+    /**
      * Appends rows to the sheet with optional forced-text columns.
      * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
      * @param {any[][]} data
