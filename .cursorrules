@@ -1,0 +1,30 @@
+{
+  "projectContext": {
+    "description": "GAS project: Google Sheets integration with multiple Wildberries API endpoints",
+    "techStack": ["Google Apps Script", "JavaScript", "Google Sheets API"],
+    "patterns": [
+      "Use Dependency Injection for GAS services (UrlFetchApp, PropertiesService)",
+      "Add retries with exponential backoff for all network calls",
+      "Log to Logger and optionally to a dedicated sheet",
+      "Sort aggregated results globally before writing to sheets"
+    ]
+  },
+  "editor": {
+    "language": "en"
+  },
+  "user_rules": [
+    "Always respond in English."
+  ],
+  "context": {
+    "include": [
+      "docs/**",
+      "tech/**"
+    ],
+    "exclude": [
+      "**/.git/**",
+      "**/node_modules/**"
+    ]
+  }
+}
+
+
